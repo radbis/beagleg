@@ -36,6 +36,13 @@ static void InitTestConfig(struct MachineControlConfig *c) {
   c->require_homing = false;
 }
 
+GCodeParserAxis GetDefiningAxis(const LinearSegmentSteps &seg) {
+  GCodeParserAxis defining = AXIS_X;
+  if (abs(seg.steps[AXIS_Y]) > abs(seg.steps[defining])) defining = AXIS_Y;
+  if (abs(seg.steps[AXIS_Z]) > abs(seg.steps[defining])) defining = AXIS_Z;
+  return defining;
+}
+
 class FakeMotorOperations : public MotorOperations {
 public:
   FakeMotorOperations(const MachineControlConfig &config)
@@ -81,9 +88,7 @@ public:
     const float dy = seg.steps[AXIS_Y] / config_.steps_per_mm[AXIS_Y];
     const float dz = seg.steps[AXIS_Z] / config_.steps_per_mm[AXIS_Z];
     const float euclid_len = sqrtf(dx*dx + dy*dy + dz*dz);
-    GCodeParserAxis defining = AXIS_X;
-    if (abs(seg.steps[AXIS_Y]) > abs(seg.steps[defining])) defining = AXIS_Y;
-    if (abs(seg.steps[AXIS_Z]) > abs(seg.steps[defining])) defining = AXIS_Z;
+    GCodeParserAxis defining = GetDefiningAxis(seg);
     const float defining_len = fabsf(seg.steps[defining]
                                      / config_.steps_per_mm[defining]);
     // Diagonal is moving faster than the defining axis component by this:
@@ -102,16 +107,25 @@ private:
 
 class PlannerHarness {
 public:
-  PlannerHarness(float threshold_angle = 0)
-    : motor_ops_(config_), finished_(false) {
-    InitTestConfig(&config_);
-    config_.threshold_angle = threshold_angle;
+  // If angle or config is not set, assumes default. Takes ownership of
+  // config.
+  PlannerHarness(float threshold_angle = 0,
+                 MachineControlConfig *config = NULL)
+    : config_(config ? config : new MachineControlConfig()),
+      motor_ops_(*config_), finished_(false) {
+    if (!config) {
+      InitTestConfig(config_);
+      config_->threshold_angle = threshold_angle;
+    }
     simulated_hardware_.AddMotorMapping(AXIS_X, 1, false);
     simulated_hardware_.AddMotorMapping(AXIS_Y, 2, false);
     simulated_hardware_.AddMotorMapping(AXIS_Z, 3, false);
-    planner_ = new Planner(&config_, &simulated_hardware_, &motor_ops_);
+    planner_ = new Planner(config_, &simulated_hardware_, &motor_ops_);
   }
-  ~PlannerHarness() { delete planner_; }
+  ~PlannerHarness() {
+    delete planner_;
+    delete config_;
+  }
 
   void Enqueue(const AxesRegister &target, float feed) {
     assert(!finished_);   // Can only call if segments() has not been called.
@@ -128,7 +142,7 @@ public:
   }
 
 private:
-  MachineControlConfig config_;
+  MachineControlConfig *config_;
   FakeMotorOperations motor_ops_;
   HardwareMapping simulated_hardware_;
   bool finished_;
@@ -185,9 +199,11 @@ TEST(PlannerTest, SimpleMove_ReachesFullSpeed) {
   VerifyCommonExpectations(plantest.segments());
 }
 
-TEST(PlannerTest, SimpleMove_SpeedsDifferentForDifferentAxes) {
+TEST(PlannerTest, SimpleMove_StepSpeedsDifferentForDifferentAxes) {
   const float base_steps_per_mm = 1000;
   const float test_speed_mm_per_sec = 10;
+
+  // Single axis: expect step-speed of that
   {
     PlannerHarness plantest;
 
@@ -200,6 +216,8 @@ TEST(PlannerTest, SimpleMove_SpeedsDifferentForDifferentAxes) {
     EXPECT_EQ(base_steps_per_mm * test_speed_mm_per_sec,
               plantest.segments()[1].v0);
   }
+
+  // Other axis: expect configured different step-speed of that
   {
     PlannerHarness plantest;
 
@@ -244,7 +262,65 @@ TEST(PlannerTest, SimpleMove_SpeedsDifferentForDifferentAxes) {
                     * STEP_FACTOR_BETWEEN_AXES,
                     plantest.segments()[1].v0);
   }
+}
 
+// When we move axes, they should try to reach the speed the user requested
+// unless there is maximum speed an axis can do (very typical in CNC machines
+// in which the Z axis is much slower than X or Y).
+//
+// When we do a diagonal move and request a super-high speed then we will be
+// limited by the max feedrates on each of these axes: The slowest axis
+// determines how fast we overall can go: once the slowest axis reaches its
+// configured maximum speed _in its direction_, we can't go any faster.
+//
+// Say our X-axis is limited to 1000mm/s and the Z axis to 10mm/s. If we
+// do a diagonal 1000mm move in X direction and 20mm in Z direction, then
+// we effectively limit the X direction to 500mm/s because the Z axis uses
+// its sweet time.
+//
+// This is what we're testing here. However it seems like we are limiting the
+// overall speed to whatever the defining axis is. Which in our case would be:
+// the whole 1000mm segment would move with 10mm/s if Z is the dominant axis
+// (which they can - they often have many more steps/mm).
+TEST(PlannerTest, SimpleMove_AxisSpeedLimitClampsOverallSpeed) {
+  const float kClampFeedrate = 10.0;
+  GCodeParserAxis kSlowAxis = AXIS_Y;
+  MachineControlConfig *config = new MachineControlConfig();
+  InitTestConfig(config);
+  config->max_feedrate[AXIS_X] = (AXIS_X == kSlowAxis)
+    ? kClampFeedrate : kClampFeedrate * 10;
+  config->max_feedrate[AXIS_Y] = (AXIS_Y == kSlowAxis)
+    ? kClampFeedrate : kClampFeedrate * 10;
+  PlannerHarness plantest(0, config);
+
+  // Let's do a diagonal move.
+  // First: AXIS_X shall be dominant
+  AxesRegister pos;
+  pos[AXIS_X] = 100;
+  pos[AXIS_Y] = 100;
+  // We request an extremely high speed, but expect it to be clamped to whatever
+  // that axis can do.
+  plantest.Enqueue(pos, 100000);
+
+  EXPECT_EQ(3, plantest.segments().size());  // accel - move - decel
+
+  // We accelerate and decelerate, the middle section is constant speed.
+  const LinearSegmentSteps &constant_speed_section = plantest.segments()[1];
+  EXPECT_EQ(constant_speed_section.v0, constant_speed_section.v1);
+
+  // The axis with the slowest allowed feedrate should now about max out
+  // its declared speed.
+  GCodeParserAxis defining = GetDefiningAxis(constant_speed_section);
+  // Get the step speed of the axis_x we're interested in.
+  float step_speed_of_interest = constant_speed_section.v0
+    * constant_speed_section.steps[kSlowAxis]
+    / constant_speed_section.steps[defining];
+
+  // This is failing. Instead of limiting the speed to the maximum the axis can
+  // do, it looks like we clamp the euklidian speed to what the defining
+  // axis can do.
+  EXPECT_FLOAT_EQ(kClampFeedrate * config->steps_per_mm[kSlowAxis],
+                  step_speed_of_interest);
 }
 
 static std::vector<LinearSegmentSteps> DoAngleMove(float threshold_angle,
