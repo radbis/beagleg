@@ -40,14 +40,6 @@ struct AxisTarget {
   float speed;           // Speed in euclidian space
   float dx, dy, dz;      // 3D distance to previous position.
   float len;             // 3D length
-
-  // --- old parts
-  int position_steps[GCODE_NUM_AXES];  // Absolute position at end of segment. In steps.
-
-  // Derived values
-  int delta_steps[GCODE_NUM_AXES];     // Difference to previous position.
-  enum GCodeParserAxis defining_axis;  // index into defining axis.
-  float step_speed;                         // (desired) speed in steps/s on defining axis.
   unsigned short aux_bits;             // Auxillary bits in this segment; set with M42
 };
 
@@ -70,38 +62,17 @@ public:
   void machine_move(const AxesRegister &axis, float feedrate);
   void bring_path_to_halt();
 
-  float acceleration_for_move(const int *axis_steps,
-                              enum GCodeParserAxis defining_axis) {
-    return max_axis_accel_[defining_axis];
-    // TODO: we need to scale the acceleration if one of the other axes could't
-    // deal with it. Look at axis steps for that.
-  }
-
-  // Avoid division by zero if there is no config defined for axis.
-  float axis_delta_to_mm(const AxisTarget *pos, enum GCodeParserAxis axis) {
-    if (cfg_->steps_per_mm[axis])
-      return (float)pos->delta_steps[axis] / cfg_->steps_per_mm[axis];
-    return 0.0f;
-  }
-
-  float euclidian_speed(const struct AxisTarget *t);
-
   void GetCurrentPosition(AxesRegister *pos);
   int DirectDrive(GCodeParserAxis axis, float distance, float v0, float v1);
   void SetExternalPosition(GCodeParserAxis axis, float pos);
-
-  // Given the desired target speed of the defining axis and the steps to be
-  // performed on all axes, determine if we need to scale down as to not exceed
-  // the individual maximum speed constraints on any axis. Return the new speed
-  // of the defining axis.
-  float clamp_to_limits(enum GCodeParserAxis defining_axis,
-                        const float target_value,
-                        const int *axis_steps);
 
 private:
   const struct MachineControlConfig *const cfg_;
   HardwareMapping *const hardware_mapping_;
   MotorOperations *const motor_ops_;
+
+  // Latest enqueued motor position after the last motor segment sent out.
+  int motor_position_[GCODE_NUM_AXES];
 
   // Next buffered positions. Written by incoming gcode, read by outgoing
   // motor movements.
@@ -110,7 +81,7 @@ private:
   // Pre-calculated per axis limits in steps, steps/s, steps/s^2
   // All arrays are indexed by axis.
   AxesRegister max_axis_speed_;   // max travel speed hz
-  AxesRegister max_axis_accel_;   // acceleration hz/s
+  AxesRegister max_axis_step_accel_;   // acceleration hz/s
   float highest_accel_;           // hightest accel of all axes.
 
   HardwareMapping::AuxBitmap last_aux_bits_;  // last enqueued aux bits.
@@ -121,23 +92,10 @@ private:
 
 static inline int round2int(float x) { return (int) roundf(x); }
 
-// Speed relative to defining axis
-static float get_speed_factor_for_axis(const struct AxisTarget *t,
-                                       enum GCodeParserAxis request_axis) {
-  if (t->delta_steps[t->defining_axis] == 0) return 0.0f;
-  return 1.0f * t->delta_steps[request_axis] / t->delta_steps[t->defining_axis];
-}
-
-// Get the speed for a particular axis. Depending on the direction, this can
-// be positive or negative.
-static float get_speed_for_axis(const struct AxisTarget *target,
-                                enum GCodeParserAxis request_axis) {
-  return target->step_speed * get_speed_factor_for_axis(target, request_axis);
-}
-
 // Given that we want to travel "s" steps, start with speed "v0",
 // accelerate peak speed v1 and slow down to "v2" with acceleration "a",
 // what is v1 ?
+// Note, it could be that we never reach v2
 static float get_peak_speed(float s, float v0, float v2, float a) {
   return sqrtf(v2*v2 + v0*v0 + 2 * a * s) / sqrtf(2);
 }
@@ -174,68 +132,24 @@ static bool subtract_steps(struct LinearSegmentSteps *value,
   return has_nonzero;
 }
 
-static bool within_acceptable_range(float new_val, float old_val, float fraction) {
-  const float max_diff = fraction * old_val;
-  if (new_val < old_val - max_diff) return false;
-  if (new_val > old_val + max_diff) return false;
-  return true;
-}
-
-// Determine the fraction of the speed that "from" should decelerate
-// to at the end of its travel.
-// The way trapezoidal moves work, be still have to decelerate to zero in
-// most times, which is inconvenient. TODO(hzeller): speed matching is not
-// cutting it :)
-static float determine_joining_speed(const struct AxisTarget *from,
-                                     const struct AxisTarget *to,
-                                     const float threshold) {
+// Determine what speed we should have at the border between now and next
+// segment.
+static bool determine_joining_speed(const struct AxisTarget *from,
+                                    const struct AxisTarget *to,
+                                    const float threshold) {
   // the dot product of the vectors
   const float dot = from->dx*to->dx + from->dy*to->dy + from->dz*to->dz;
   const float mag = from->len * to->len;
-  if (dot == 0) return 0.0f;        // orthogonal 90 degree, full stop
-  if (dot == mag) return to->step_speed; // codirectional 0 degree, keep accelerating
+  if (dot == 0) return 0.0f;     // orthogonal 90 degree, full stop
+  if (dot == mag) return to->speed;  // codirectional 0 degree, keep accelerating
 
-  // the angle between the vectors
+  // The angle between the vectors
   const float rad2deg = 180.0 / M_PI;
   const float angle = fabsf(acosf(dot / mag) * rad2deg);
-
   if (angle <= threshold)
-    return to->step_speed;               // in tolerance, keep accelerating
-  if (angle >= 45.0f)
-    return 0.0f;                    // angle to large, come to full stop
+    return to->speed;               // in tolerance, keep accelerating
 
-  // The angle between the from and to segments is < 45 degrees but greater
-  // than the threshold. Use the "old" logic to determine the joining speed
-  //
-  // Our goal is to figure out what our from defining speed should
-  // be at the end of the move.
-  bool is_first = true;
-  float from_defining_speed = from->step_speed;
-  const int from_defining_steps = from->delta_steps[from->defining_axis];
-  for (const GCodeParserAxis axis : AllAxes()) {
-    const int from_delta = from->delta_steps[axis];
-    const int to_delta = to->delta_steps[axis];
-
-    // Quick integer decisions
-    if (from_delta == 0 && to_delta == 0) continue;   // uninteresting: no move.
-    if (from_delta == 0 || to_delta == 0) return 0.0f; // accel from/to zero
-    if ((from_delta < 0 && to_delta > 0) || (from_delta > 0 && to_delta < 0))
-      return 0.0f;  // turing around
-
-    float to_speed = get_speed_for_axis(to, axis);
-    // What would this speed translated to our defining axis be ?
-    float speed_conversion = 1.0f * from_defining_steps / from_delta;
-    float goal = to_speed * speed_conversion;
-    if (goal < 0.0f) return 0.0f;
-    if (is_first || within_acceptable_range(goal, from_defining_speed, 1e-5)) {
-      if (goal < from_defining_speed) from_defining_speed = goal;
-      is_first = false;
-    } else {
-      return 0.0f;  // Too far off.
-    }
-  }
-
-  return from_defining_speed;
+  return 0.0f;
 }
 
 Planner::Impl::Impl(const MachineControlConfig *config,
@@ -248,26 +162,17 @@ Planner::Impl::Impl(const MachineControlConfig *config,
   // wherever the endswitch is for each axis.
   struct AxisTarget *init_axis = planning_buffer_.append();
   bzero(init_axis, sizeof(*init_axis));
-  // TODO(hzeller): get this homing position from somewhere else. Doesn't
-  // gcode-machine-control already have a function for this ?
-  for (const GCodeParserAxis axis : AllAxes()) {
-    HardwareMapping::AxisTrigger trigger = cfg_->homing_trigger[axis];
-    if (trigger == 0) {
-      init_axis->position_steps[axis] = 0;
-    }
-    else {
-      const float home_pos = trigger == HardwareMapping::TRIGGER_MIN
-        ? 0 : cfg_->move_range_mm[axis];
-      init_axis->position_steps[axis] = round2int(home_pos * cfg_->steps_per_mm[axis]);
-    }
-  }
+  // TODO(planner-hz): get homing position and assign to init_axis->target.
+  // also, then convert them to the motor position.
+  bzero(motor_position_, sizeof(motor_position_));
+
   position_known_ = true;
 
   float lowest_accel = cfg_->max_feedrate[AXIS_X] * cfg_->steps_per_mm[AXIS_X];
   for (const GCodeParserAxis i : AllAxes()) {
     max_axis_speed_[i] = cfg_->max_feedrate[i] * cfg_->steps_per_mm[i];
     const float accel = cfg_->acceleration[i] * cfg_->steps_per_mm[i];
-    max_axis_accel_[i] = accel;
+    max_axis_step_accel_[i] = accel;
     if (accel > highest_accel_)
       highest_accel_ = accel;
     if (accel < lowest_accel)
@@ -286,34 +191,6 @@ void Planner::Impl::assign_steps_to_motors(struct LinearSegmentSteps *command,
   hardware_mapping_->AssignMotorSteps(axis, steps, command);
 }
 
-// Example with speed: given i the axis with the highest (relative) out of bounds
-// speed, what's the speed of the defining_axis so that every speed respects i's
-// bounds? The defining axis should be rescaled with this maximum offset.
-// offset = speed_limit[i] / speed[i]
-float Planner::Impl::clamp_to_limits(enum GCodeParserAxis defining_axis,
-                                     const float target_speed,
-                                     const int *axis_steps) {
-  float ratio, max_offset = 1, offset;
-  const FloatAxisConfig &max_axis_speed = cfg_->max_feedrate;
-  const FloatAxisConfig &steps_per_mm = cfg_->steps_per_mm;
-  for (const GCodeParserAxis i : AllAxes()) {
-    ratio = fabs(((float) axis_steps[i] * steps_per_mm[defining_axis])
-            / (axis_steps[defining_axis] * steps_per_mm[i]));
-    offset = ratio > 0 ? max_axis_speed[i] / (target_speed * ratio) : 1;
-    if (offset < max_offset) max_offset = offset;
-  }
-  return target_speed * max_offset;
-}
-
-float Planner::Impl::euclidian_speed(const struct AxisTarget *t) {
-  float speed_factor = 1.0;
-  if (t->len > 0) {
-    const float axis_len_mm = axis_delta_to_mm(t, t->defining_axis);
-    speed_factor = fabs(axis_len_mm) / t->len;
-  }
-  return t->step_speed * speed_factor;
-}
-
 // Move the given number of machine steps for each axis.
 //
 // This will be up to three segments: accelerating from last_pos speed to
@@ -327,7 +204,22 @@ float Planner::Impl::euclidian_speed(const struct AxisTarget *t) {
 void Planner::Impl::move_machine_steps(const struct AxisTarget *last_pos,
                                        struct AxisTarget *target_pos,
                                        const struct AxisTarget *upcoming) {
-  if (target_pos->delta_steps[target_pos->defining_axis] == 0) {
+  // TODO(planner-hz): this only works if there is any euclidian axis right now.
+  int delta_steps[GCODE_NUM_AXES];
+  int abs_defining_axis_steps = 0;
+  enum GCodeParserAxis defining_axis = AXIS_X;
+  for (GCodeParserAxis a : AllAxes()) {
+    int new_machine_pos = target_pos->target[a] * cfg_->steps_per_mm[a];
+    int delta = new_machine_pos - motor_position_[a];
+    delta_steps[a] = delta;
+    if (abs(delta) > abs_defining_axis_steps) {
+      abs_defining_axis_steps = abs(delta);
+      defining_axis = a;
+    }
+    motor_position_[a] = new_machine_pos;
+  }
+
+  if (abs_defining_axis_steps == 0) {
     if (last_aux_bits_ != target_pos->aux_bits) {
       // Special treatment: bits changed since last time, let's push them through.
       struct LinearSegmentSteps bit_set_command = {};
@@ -337,127 +229,90 @@ void Planner::Impl::move_machine_steps(const struct AxisTarget *last_pos,
     }
     return;
   }
+
   struct LinearSegmentSteps accel_command = {};
   struct LinearSegmentSteps move_command = {};
   struct LinearSegmentSteps decel_command = {};
 
-  assert(target_pos->step_speed > 0);  // Speed is always a positive scalar.
-
   // Aux bits are set synchronously with what we need.
   move_command.aux_bits = target_pos->aux_bits;
-  const enum GCodeParserAxis defining_axis = target_pos->defining_axis;
 
-  // Common settings.
+  // Copy over common settings (currently: only aux_bits). Maybe simplify.
   memcpy(&accel_command, &move_command, sizeof(accel_command));
   memcpy(&decel_command, &move_command, sizeof(decel_command));
-
-  // Always start from the last steps/sec speed to avoid motion glitches.
-  // The planner will use that speed to determine what the peak speed for
-  // this move is and if we need to accel to reach the desired target speed.
-  const float last_speed = last_pos->step_speed;
 
   // We need to arrive at a speed that the upcoming move does not have
   // to decelerate further (after all, it has a fixed feed-rate it should not
   // go over).
-  float next_speed = determine_joining_speed(target_pos, upcoming,
-                                             cfg_->threshold_angle);
-  // Clamp the next speed to insure that this segment does not go over.
-  if (next_speed > target_pos->step_speed)
-    next_speed = target_pos->step_speed;
-
-  const int *axis_steps = target_pos->delta_steps;  // shortcut.
-  const int abs_defining_axis_steps = abs(axis_steps[defining_axis]);
-  const float a = acceleration_for_move(axis_steps, defining_axis);
-  const float peak_speed = get_peak_speed(abs_defining_axis_steps,
-                                          last_speed, next_speed, a);
+  const float last_end_speed = last_pos->speed;
+  // End speed is either 0, when there is a corner, or the speed of the
+  // upcoming segment.
+  const float end_speed = determine_joining_speed(target_pos, upcoming,
+                                                  cfg_->threshold_angle);
+  const float a = cfg_->acceleration[defining_axis];  // TODO(planner-hz): scale
+  const float peak_speed = get_peak_speed(target_pos->len,
+                                          last_end_speed, end_speed, a);
   assert(peak_speed > 0);
-
-  // TODO: if we only have < 5 steps or so, we should not even consider
-  // accelerating or decelerating, but just do one speed.
-
-  if (peak_speed < target_pos->step_speed) {
-    target_pos->step_speed = peak_speed;  // Don't manage to accelerate to desired v
+  if (peak_speed < target_pos->speed) {
+    // Didn't manage to accelerate to desired v. Let the next segment know
+    // to take it from here.
+    target_pos->speed = peak_speed;
   }
 
-  // Make sure the target feedrate for the move is clamped to what all the
-  // moving axes can reach.
-  float target_feedrate = target_pos->step_speed / cfg_->steps_per_mm[defining_axis];
-  target_feedrate = clamp_to_limits(defining_axis, target_feedrate, axis_steps);
-  target_pos->step_speed = target_feedrate * cfg_->steps_per_mm[defining_axis];
-
+  // Determine accel fraction. Possibly modify our current target speed
+  // if we can't reach the speed. In that case, leave the next segment to
+  // go from here.
   const float accel_fraction =
-    (last_speed < target_pos->step_speed)
-    ? steps_for_speed_change(a, last_speed, &target_pos->step_speed,
+    (last_end_speed < target_pos->speed)
+    ? steps_for_speed_change(a, last_end_speed, &target_pos->speed,
                              abs_defining_axis_steps) / abs_defining_axis_steps
     : 0;
 
   // We only decelerate if the upcoming speed is _slower_
-  float dummy_next_speed = next_speed;  // Don't care to modify; we don't have
+  float dummy_next_speed = end_speed;  // Don't care to modify; we don't have
   const float decel_fraction =
-    (next_speed < target_pos->step_speed)
-    ? steps_for_speed_change(-a, target_pos->step_speed, &dummy_next_speed,
+    (end_speed < target_pos->speed)
+    ? steps_for_speed_change(-a, target_pos->speed, &dummy_next_speed,
                              abs_defining_axis_steps) / abs_defining_axis_steps
     : 0;
 
-#if 0
-  // Useful debugging info.
-  // TODO: we get a decel glitch when the last_pos has accelerated to a speed
-  // that is faster than the target can decelerate from.
-  if (dummy_next_speed != next_speed) {
-    fprintf(stderr, "  \033[1m\033[31mGLITCH\033[0m "
-                    "- move too short for full decel (reached v1: %10.2f)\n",
-            dummy_next_speed);
-  }
-#endif
-
   assert(accel_fraction + decel_fraction <= 1.0 + 1e-3);
-
-#if 0
-  // fudging: if we have tiny acceleration segments, don't do these at all
-  // but only do speed; otherwise we have a lot of rattling due to many little
-  // segments of acceleration/deceleration (e.g. for G2/G3).
-  // This is not optimal. Ideally, we would actually calculate in terms of
-  // jerk and optimize to stay within that constraint.
-  const int accel_decel_steps
-    = (accel_fraction + decel_fraction) * abs_defining_axis_steps;
-  const float accel_decel_mm
-    = (accel_decel_steps / cfg_->steps_per_mm[defining_axis]);
-  const char do_accel = (accel_decel_mm > 2 || accel_decel_steps > 16);
-#else
-  const char do_accel = 1;
-#endif
-
   bool has_accel = false;
   bool has_move = false;
   bool has_decel = false;
 
-  if (do_accel && accel_fraction * abs_defining_axis_steps > 0) {
+  const float defining_axis_fraction =
+    (target_pos->target[defining_axis] - last_pos->target[defining_axis]) / target_pos->len;
+  const float to_defining_axis_speed = defining_axis_fraction * cfg_->steps_per_mm[defining_axis];
+
+  // TODO(planner-hz): last defining axis fraction.
+  if (accel_fraction * abs_defining_axis_steps > 0) {
     has_accel = true;
-    accel_command.v0 = last_speed;           // Last speed of defining axis
-    accel_command.v1 = target_pos->step_speed;    // New speed of defining axis
+    accel_command.v0 = last_pos->speed * to_defining_axis_speed;
+    accel_command.v1 = target_pos->speed * to_defining_axis_speed;
 
     // Now map axis steps to actual motor driver
-    for (const GCodeParserAxis a : AllAxes()) {
-      const int accel_steps = round2int(accel_fraction * axis_steps[a]);
-      assign_steps_to_motors(&accel_command, a, accel_steps);
+    for (const GCodeParserAxis axis : AllAxes()) {
+      const int accel_steps = round2int(accel_fraction * delta_steps[axis]);
+      assign_steps_to_motors(&accel_command, axis, accel_steps);
     }
   } else {
-    if (last_speed) target_pos->step_speed = last_speed; // No accel so use the last speed
+    if (last_end_speed) target_pos->speed = last_end_speed; // No accel so use the last speed
   }
 
-  move_command.v0 = target_pos->step_speed;
-  move_command.v1 = target_pos->step_speed;
+  move_command.v0 = target_pos->speed * to_defining_axis_speed;
+  move_command.v1 = target_pos->speed * to_defining_axis_speed;
 
-  if (do_accel && decel_fraction * abs_defining_axis_steps > 0) {
+  if (decel_fraction * abs_defining_axis_steps > 0) {
     has_decel = true;
-    decel_command.v0 = target_pos->step_speed;
-    decel_command.v1 = next_speed;
-    target_pos->step_speed = next_speed;
+    decel_command.v0 = target_pos->speed * to_defining_axis_speed;
+    decel_command.v1 = end_speed * to_defining_axis_speed;
+    target_pos->speed = end_speed;
 
     // Now map axis steps to actual motor driver
-    for (const GCodeParserAxis a : AllAxes()) {
-      const int decel_steps = round2int(decel_fraction * axis_steps[a]);
-      assign_steps_to_motors(&decel_command, a, decel_steps);
+    for (const GCodeParserAxis axis : AllAxes()) {
+      const int decel_steps = round2int(decel_fraction * delta_steps[axis]);
+      assign_steps_to_motors(&decel_command, axis, decel_steps);
     }
   }
 
@@ -465,7 +320,7 @@ void Planner::Impl::move_machine_steps(const struct AxisTarget *last_pos,
   // So we start with all steps and subtract steps done in acceleration and
   // deceleration.
   for (const GCodeParserAxis a : AllAxes()) {
-    assign_steps_to_motors(&move_command, a, axis_steps[a]);
+    assign_steps_to_motors(&move_command, a, delta_steps[a]);
   }
   subtract_steps(&move_command, accel_command);
   has_move = subtract_steps(&move_command, decel_command);
@@ -489,53 +344,46 @@ void Planner::Impl::issue_motor_move_if_possible() {
   }
 }
 
-void Planner::Impl::machine_move(const AxesRegister &axis, float feedrate) {
+void Planner::Impl::machine_move(const AxesRegister &target, float feedrate) {
   assert(position_known_);   // call SetExternalPosition() after DirectDrive()
   // We always have a previous position.
   struct AxisTarget *previous = planning_buffer_.back();
   struct AxisTarget *new_pos = planning_buffer_.append();
-  int max_steps = -1;
-  enum GCodeParserAxis defining_axis = AXIS_X;
+  new_pos->target = target;
 
   // Real world -> machine coordinates. Here, we are rounding to the next full
   // step, but we never accumulate the error, as we always use the absolute
   // position as reference.
+  bool any_movement = false;
   for (const GCodeParserAxis a : AllAxes()) {
-    new_pos->position_steps[a] = round2int(axis[a] * cfg_->steps_per_mm[a]);
-    new_pos->delta_steps[a] = new_pos->position_steps[a] - previous->position_steps[a];
-
-    // The defining axis is the one that has to travel the most steps. It defines
-    // the frequency to go.
-    // All the other axes are doing a fraction of the defining axis.
-    if (abs(new_pos->delta_steps[a]) > max_steps) {
-      max_steps = abs(new_pos->delta_steps[a]);
-      defining_axis = a;
+    const int steps = round2int((new_pos->target[a] - previous->target[a])
+                                * cfg_->steps_per_mm[a]);
+    if (steps != 0) {
+      any_movement = true;   // At least one axis does more than zero steps
+      break;
     }
   }
 
-  if (max_steps == 0) {
-    // Nothing to do, ignore this move.
+  if (!any_movement) {
+    // Nothing to do, ignore this move. Since the next move will be an absolute
+    // coordinate, we don't loose it.
     planning_buffer_.pop_back();
     return;
   }
 
-  assert(max_steps > 0);
-
   new_pos->aux_bits = hardware_mapping_->GetAuxBits();
-  new_pos->defining_axis = defining_axis;
 
   // Work out the real units values for the euclidian axes now to avoid
   // having to replicate the calcs later.
-  new_pos->dx = axis_delta_to_mm(new_pos, AXIS_X);
-  new_pos->dy = axis_delta_to_mm(new_pos, AXIS_Y);
-  new_pos->dz = axis_delta_to_mm(new_pos, AXIS_Z);
+  new_pos->dx = new_pos->target[AXIS_X] - previous->target[AXIS_X];
+  new_pos->dy = new_pos->target[AXIS_Y] - previous->target[AXIS_Y];
+  new_pos->dz = new_pos->target[AXIS_Z] - previous->target[AXIS_Z];
   new_pos->len = euclid_distance(new_pos->dx, new_pos->dy, new_pos->dz);
 
   // Work out the desired euclidian travel speed in steps/s on the defining axis.
-  new_pos->step_speed = feedrate * cfg_->steps_per_mm[defining_axis];
-  new_pos->step_speed = euclidian_speed(new_pos);
-  if (new_pos->step_speed > max_axis_speed_[defining_axis])
-    new_pos->step_speed = max_axis_speed_[defining_axis];
+  new_pos->speed = feedrate;
+  // TODO(planner-hz): limit feedrate here depending on the limits per axis. This
+  // is essentially what clamp_to_limits() was.
 
   issue_motor_move_if_possible();
   path_halted_ = false;
@@ -548,12 +396,8 @@ void Planner::Impl::bring_path_to_halt() {
   // slow down. Enqueue.
   struct AxisTarget *previous = planning_buffer_.back();
   struct AxisTarget *new_pos = planning_buffer_.append();
-  for (const GCodeParserAxis a : AllAxes()) {
-    new_pos->position_steps[a] = previous->position_steps[a];
-    new_pos->delta_steps[a] = 0;
-  }
-  new_pos->defining_axis = AXIS_X;
-  new_pos->step_speed = 0;
+  new_pos->target = previous->target;
+  new_pos->speed = 0;
   new_pos->aux_bits = hardware_mapping_->GetAuxBits();
   new_pos->dx = new_pos->dy = new_pos->dz = new_pos->len = 0.0;
   issue_motor_move_if_possible();
@@ -562,12 +406,7 @@ void Planner::Impl::bring_path_to_halt() {
 
 void Planner::Impl::GetCurrentPosition(AxesRegister *pos) {
   assert(planning_buffer_.size() > 0);  // we always should have a current pos
-  const int *mpos = planning_buffer_[0]->position_steps;
-  for (const GCodeParserAxis a : AllAxes()) {
-    if (cfg_->steps_per_mm[a] != 0) {
-      (*pos)[a] = 1.0f * mpos[a] / cfg_->steps_per_mm[a];
-    }
-  }
+  *pos = planning_buffer_[0]->target;
 }
 
 int Planner::Impl::DirectDrive(GCodeParserAxis axis, float distance,
@@ -601,9 +440,10 @@ void Planner::Impl::SetExternalPosition(GCodeParserAxis axis, float pos) {
   assert(path_halted_);   // Precondition.
   position_known_ = true;
 
-  const int motor_position = pos * cfg_->steps_per_mm[axis];
-  planning_buffer_.back()->position_steps[axis] = motor_position;
-  planning_buffer_[0]->position_steps[axis] = motor_position;
+  const int motor_axis_pos = pos * cfg_->steps_per_mm[axis];
+  planning_buffer_.back()->target[axis] = pos;
+  planning_buffer_[0]->target[axis] = pos;
+  motor_position_[axis] = motor_axis_pos;
 }
 
 // -- public interface
