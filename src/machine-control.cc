@@ -53,6 +53,10 @@
 #include "sim-firmware.h"
 #include "spindle-control.h"
 
+// New. Compile-time defined.
+#include "spi-segment-queue.h"
+#define USE_SPI_BACKEND 1
+
 static int usage(const char *prog, const char *msg) {
   if (msg) {
     fprintf(stderr, "\033[1m\033[31m%s\033[0m\n\n", msg);
@@ -302,15 +306,6 @@ static std::string MakeAbsoluteFile(const char *in) {
 }
 
 int main(int argc, char *argv[]) {
-  MachineControlConfig config;
-  bool dry_run = false;
-  bool simulation_output = false;
-  const char *logfile = NULL;
-  std::string paramfile;
-  const char *config_file = NULL;
-  bool as_daemon = false;
-  const char *privs = "daemon:daemon";
-
   // Less common options don't have a short option.
   enum LongOptionsOnly {
     OPT_HELP = 1000,
@@ -359,6 +354,18 @@ int main(int argc, char *argv[]) {
     { 0,                    0,                 0,    0  },
   };
 
+  MachineControlConfig config;
+#if !USE_SPI_BACKEND
+  bool dry_run = false;
+  bool simulation_output = false;
+  FILE *wav_output = nullptr;
+#endif
+  const char *logfile = NULL;
+  std::string paramfile;
+  const char *config_file = NULL;
+  bool as_daemon = false;
+  const char *privs = "daemon:daemon";
+
   int listen_port = -1;
   int status_server_port = -1;
   char *bind_addr = NULL;
@@ -368,7 +375,7 @@ int main(int argc, char *argv[]) {
   bool allow_m111 = false;
   config.threshold_angle = 10;
   config.speed_tune_angle = 60;
-  FILE *wav_output = nullptr;
+
   int opt;
   while ((opt = getopt_long(argc, argv, "p:b:SPnNf:l:dc:W:",
                             long_options, NULL)) != -1) {
@@ -396,6 +403,7 @@ int main(int argc, char *argv[]) {
     case OPT_DISABLE_ACK_OK:
       config.acknowledge_lines = false;
       break;
+#if !USE_SPI_BACKEND
     case 'n':
       dry_run = true;
       break;
@@ -407,6 +415,7 @@ int main(int argc, char *argv[]) {
       dry_run = true;
       wav_output = fopen(optarg, "w");
       break;
+#endif
     case 'P':
       config.debug_print = true;
       break;
@@ -541,6 +550,9 @@ int main(int argc, char *argv[]) {
     }
   }
 
+#if USE_SPI_BACKEND
+  SPISegmentQueue motor_operations;
+#else
   // The backend for our stepmotor control. We either talk to the PRU or
   // just ignore them on dummy.
   MotionQueue *motion_backend;
@@ -563,6 +575,8 @@ int main(int argc, char *argv[]) {
     pru_hw_interface = new UioPrussInterface();
     motion_backend = new PRUMotionQueue(&hardware_mapping, pru_hw_interface);
   }
+  MotionQueueMotorOperations motor_operations(&hardware_mapping, motion_backend);
+#endif
 
   // Listen port bound, GPIO initialized. Ready to drop privileges.
   if (geteuid() == 0 && strlen(privs) > 0) {
@@ -575,7 +589,7 @@ int main(int argc, char *argv[]) {
   }
   Log_info("BeagleG running with PID %d", getpid());
 
-  MotionQueueMotorOperations motor_operations(&hardware_mapping, motion_backend);
+
 
   GCodeMachineControl *machine_control
     = GCodeMachineControl::Create(config, &motor_operations,
@@ -623,10 +637,12 @@ int main(int argc, char *argv[]) {
     Log_info("Caught signal: immediate exit. "
              "Skipping potential remaining queue.");
   }
-  motion_backend->Shutdown(!caught_signal);
 
+#if !USE_SPI_BACKEND
+  motion_backend->Shutdown(!caught_signal);
   delete motion_backend;
   delete pru_hw_interface;
+#endif
 
   free(bind_addr);
 
