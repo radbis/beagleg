@@ -57,12 +57,16 @@ CFLAGS+=-Wall -Wextra -W -Wno-unused-parameter -I. -I$(INCDIR_APP_LOADER) -I$(CA
 # install a 4.7 easily:
 #   sudo apt-get install g++-4.7
 #   CXX=g++-4.7 make
-CXXFLAGS+=-std=c++11 $(CFLAGS) $(CONFIG_FLAGS)
+CXXFLAGS+=-std=c++17 $(CFLAGS) $(CONFIG_FLAGS)
 CXX?=g++
+
+SIM_LIBRARY=../beagleg-fpga-backend/sim/libhsgsim.a
+SIM_INCLUDES=-I/usr/local/share/verilator/include -I../beagleg-fpga-backend/sim
+CXXFLAGS+= $(SIM_INCLUDES)
 
 LDFLAGS+=-lpthread -lm
 PRUSS_LIBS=$(LIBDIR_APP_LOADER)/libprussdrv.a
-COMMON_LIBS=common/libbeaglegbase.a gcode-parser/libgcodeparser.a
+COMMON_LIBS=common/libbeaglegbase.a gcode-parser/libgcodeparser.a $(SIM_LIBRARY)
 SUBDIRS=common gcode-parser
 
 # Assembled binary from *.p file.
@@ -73,7 +77,7 @@ GCODE_OBJECTS=gcode-machine-control.o determine-print-stats.o \
               generic-gpio.o pwm-timer.o config-parser.o \
 	      machine-control-config.o hardware-mapping.o \
 	      spindle-control.o planner.o adc.o \
-	      spi-segment-queue.o
+	      spi-segment-queue.o spi.o
 OBJECTS=motion-queue-motor-operations.o sim-firmware.o sim-audio-out.o pru-motion-queue.o uio-pruss-interface.o $(GCODE_OBJECTS)
 MAIN_OBJECTS=machine-control.o gcode-print-stats.o gcode2ps.o
 TEST_FRAMEWORK_OBJECTS=gtest-all.o gmock-all.o
@@ -85,6 +89,9 @@ DEPENDENCY_RULES=$(OBJECTS:=.d) $(UNITTEST_BINARIES:=.o.d) $(MAIN_OBJECTS:=.d) h
 
 all : $(TARGETS)
 
+$(SIM_LIBRARY): FORCE
+	$(MAKE) -C $(dir $(SIM_LIBRARY))
+
 common/libbeaglegbase.a: FORCE
 	$(MAKE) -C common
 
@@ -94,7 +101,7 @@ gcode-parser/libgcodeparser.a: FORCE
 ../gcode-print-stats: gcode-print-stats.o $(GCODE_OBJECTS) $(COMMON_LIBS)
 	$(CROSS_COMPILE)$(CXX) -o $@ $^ $(COMMON_LIBS) $(LDFLAGS)
 
-../machine-control: machine-control.o $(OBJECTS) $(COMMON_LIBS)
+../machine-control: machine-control.o $(OBJECTS) $(COMMON_LIBS) $(SIM_LIBRARY)
 	$(CROSS_COMPILE)$(CXX) -o $@ $^ $(COMMON_LIBS) $(PRUSS_LIBS) $(LDFLAGS)
 
 # While this is developed and does not have a final name yet, let's not make
