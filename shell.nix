@@ -10,7 +10,7 @@ pkgs.mkShell {
       gtest
       valgrind
       ghostscript
-      clang-tools_19
+      llvmPackages_19.clang-tools
       graphviz
     ];
   shellHook =
